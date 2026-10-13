@@ -43,6 +43,8 @@ SERVICES = ("my-service",)
 SSH_KEY = "~/.ssh/id_ed25519"
 SERVER_HOST = "192.0.2.1"      # 192.0.2.0/24 зарезервирован для примеров
 SERVER_PORT = 22
+SYSV = Path("/var/service")
+CHECK_SYSTEM = True
 
 
 def load_conf(path: Path | None = None) -> bool:
@@ -74,6 +76,9 @@ def load_conf(path: Path | None = None) -> bool:
             SERVER_PORT = int(vals["server_port"])
         except ValueError:
             pass
+    if "check_system" in vals:
+        global CHECK_SYSTEM
+        CHECK_SYSTEM = vals["check_system"].lower() not in ("0", "no", "false", "off")
     return True
 
 
@@ -149,6 +154,136 @@ def ppid_of(pid: int) -> int:
         return int(raw[raw.rindex(")") + 2:].split()[1])
     except (OSError, ValueError, IndexError):
         return 0
+
+
+def proc_table() -> dict[int, tuple[int, str, int]]:
+    """pid → (ppid, cmdline, starttime_ticks). Один проход по /proc.
+
+    /proc/PID/stat читается даже для процессов root, поэтому аптайм
+    чужого процесса считается без всяких прав. А вот supervise/
+    у системных сервисов закрыт, и аптайм оттуда не взять.
+    """
+    try:
+        hz = os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError):
+        hz = 100
+    out = {}
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            raw = (entry / "stat").read_text(errors="replace")
+            cmd = (entry / "cmdline").read_bytes().decode(
+                "utf-8", "replace").replace("\0", " ").strip()
+        except OSError:
+            continue                      # процесс умер между iterdir и чтением
+        try:
+            tail = raw[raw.rindex(")") + 2:].split()
+            out[int(entry.name)] = (int(tail[1]), cmd, int(tail[19]))
+        except (ValueError, IndexError):
+            continue
+    return out
+
+
+def uptime_of(pid: int, table: dict, up: float, hz: int) -> float | None:
+    rec = table.get(pid)
+    if rec is None:
+        return None
+    return max(0.0, up - rec[2] / hz)
+
+
+def check_system(p: Palette, verbose: bool) -> list[tuple[str, str, str]]:
+    """Системные сервисы из /var/service.
+
+    Смотреть тут нечем: каталоги supervise/ принадлежат root, `sv status`
+    отдаёт «access denied», и аптайм оттуда не достать. Единственное,
+    что доступно без прав, — /proc. Оттуда и берём всё.
+
+    Различает сервис runsv жив даже когда сервис лежит: он его
+    караулит. Различает именно наличие рабочего процесса.
+
+    Ловушка: у сервиса с log-сервисом есть ещё и vlogger, он тоже
+    ребёнок runsv. Поэтому vlogger в кандидаты не идёт.
+    """
+    if not CHECK_SYSTEM or not SYSV.is_dir():
+        return []
+    try:
+        names = sorted(e.name for e in SYSV.iterdir() if e.is_dir() or e.is_symlink())
+    except OSError as exc:
+        return [("warn", "системные сервисы", "каталог не читается: %s" % exc)]
+    if not names:
+        return []
+
+    table = proc_table()
+    try:
+        up = float(Path("/proc/uptime").read_text().split()[0])
+        hz = os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, IndexError):
+        up, hz = 0.0, 100
+
+    down, young, youngest = [], [], None
+    for name in names:
+        rv = [pid for pid, (_pp, cmd, _st) in table.items()
+              if cmd == "runsv " + name]
+        if not rv:
+            down.append((name, "нет runsv — не супервизится"))
+            continue
+        kids = [pid for pid, (pp, cmd, _st) in table.items()
+                if pp == rv[0] and cmd and "vlogger" not in cmd]
+        if not kids:
+            down.append((name, "runsv жив, рабочего процесса нет"))
+            continue
+        oldest = None
+        for k in kids:
+            u = uptime_of(k, table, up, hz)
+            if u is not None and (oldest is None or u > oldest):
+                oldest = u
+        if oldest is not None:
+            if youngest is None or oldest < youngest[1]:
+                youngest = (name, oldest)
+            if oldest < 90:
+                young.append(name)
+
+    rows = []
+    if down:
+        detail = "; ".join("%s — %s" % (n, why) for n, why in down[:4])
+        if len(down) > 4:
+            detail += "; и ещё %d" % (len(down) - 4)
+        rows.append(("bad", "системные сервисы",
+                     "%d из %d лежат: %s" % (len(down), len(names), detail)))
+    elif young:
+        rows.append(("warn", "системные сервисы",
+                     "все %d живы, но %s только что поднялись — проверь лог"
+                     % (len(names), ", ".join(young))))
+    else:
+        extra = ""
+        if youngest:
+            extra = ", самый молодой %s — %s" % (
+                youngest[0], age_words(youngest[1]).replace(" назад", ""))
+        rows.append(("ok", "системные сервисы",
+                     "%d из %d живы%s" % (len(names), len(names), extra)))
+
+    if verbose:
+        for name in names:
+            rv = [pid for pid, (_pp, cmd, _st) in table.items()
+                  if cmd == "runsv " + name]
+            if not rv:
+                continue
+            kids = [pid for pid, (pp, cmd, _st) in table.items()
+                    if pp == rv[0] and cmd and "vlogger" not in cmd]
+            if not kids:
+                continue
+            best = None
+            for k in kids:
+                u = uptime_of(k, table, up, hz)
+                if u is not None and (best is None or u > best[0]):
+                    best = (u, table[k][1])
+            if best:
+                rows.append(("ok", "  %s" % name,
+                             "%s, жив %s"
+                             % (best[1][:40],
+                                age_words(best[0]).replace(" назад", ""))))
+    return rows
 
 
 def belongs_to(pid: int, name: str, depth: int = 4) -> bool:
@@ -470,6 +605,7 @@ def main(argv=None) -> int:
         except Exception as exc:                      # noqa: BLE001
             rows.append(("bad", getattr(fn, "__name__", "проверка"),
                          "проверка упала: %s" % exc))
+    rows.extend(check_system(p, args.verbose))
     rows.extend(check_server(args.verbose, p))
     rows.extend(run_verbose_tools(args.verbose, p))
 

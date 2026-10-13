@@ -265,6 +265,160 @@ class Faults(unittest.TestCase):
         self.assertIn("ВНИМАНИЕ", out)
 
 
+class SystemServices(unittest.TestCase):
+    """Системные сервисы. Проверяются на подставном /proc: настоящий
+    /var/service неприкосновенен, а проверять надо упавшие ветки."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = load()
+
+    def setUp(self):
+        self.saved = {n: getattr(self.mod, n)
+                      for n in ("SYSV", "CHECK_SYSTEM")}
+        self.addCleanup(
+            lambda: [setattr(self.mod, k, v) for k, v in self.saved.items()])
+        self.tmp = Path(tempfile.mkdtemp(prefix="health-sys-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.mod.SYSV = self.tmp
+        self.mod.CHECK_SYSTEM = True
+        # Код читает аптайм из настоящего /proc/uptime, значит и
+        # подставные моменты старта надо считать от него же. Иначе
+        # starttime оказывается в будущем, аптайм обрезается в ноль
+        # и всё выглядит только что запущенным.
+        self.uptime = float(Path("/proc/uptime").read_text().split()[0])
+
+    def services(self, *names):
+        """Создаёт каталоги сервисов. Не создал — сервис считается
+        отсутствующим, и проверка права это заметить."""
+        for n in names:
+            (self.tmp / n).mkdir(exist_ok=True)
+
+    def table(self, mapping):
+        """mapping: pid → (ppid, cmdline, age_seconds)"""
+        hz = 100
+        return {pid: (ppid, cmd, int((self.uptime - age) * hz))
+                for pid, (ppid, cmd, age) in mapping.items()}
+
+    def run_check(self, mapping, verbose=False):
+        saved = self.mod.proc_table
+        self.mod.proc_table = lambda: mapping
+        self.addCleanup(setattr, self.mod, "proc_table", saved)
+        return self.mod.check_system(_Pal(), verbose)
+
+    # ------------------------------------------------------------- ветки
+    def test_all_up_is_ok(self):
+        self.services("svc-a", "svc-b")
+        m = self.table({
+            100: (1, "runsv svc-a", 5000),
+            101: (100, "/usr/bin/svc-a --daemon", 4000),
+            200: (1, "runsv svc-b", 3000),
+            201: (200, "/usr/bin/svc-b --daemon", 2000),
+        })
+        rows = self.run_check(m)
+        self.assertEqual(rows[0][0], "ok", rows)
+        self.assertIn("2 из 2", rows[0][2])
+
+    def test_no_runsv_is_stop(self):
+        self.services("svc-a")
+        m = self.table({101: (1, "/usr/bin/svc-a --daemon", 4000)})
+        rows = self.run_check(m)
+        self.assertEqual(rows[0][0], "bad", rows)
+        self.assertIn("svc-a", rows[0][2])
+
+    def test_runsv_without_child_is_stop(self):
+        """runsv караулит и лежащий сервис — судить надо по детям."""
+        self.services("svc-a", "svc-b")
+        m = self.table({
+            100: (1, "runsv svc-a", 5000),
+            200: (1, "runsv svc-b", 3000),
+            201: (200, "/usr/bin/svc-b --daemon", 2000),
+        })
+        rows = self.run_check(m)
+        self.assertEqual(rows[0][0], "bad", rows)
+        self.assertIn("svc-a", rows[0][2])
+
+    def test_only_vlogger_is_not_alive(self):
+        """Ловушка: у сервиса с log-сервисом есть ребёнок-vlogger.
+        Он не считается рабочим процессом."""
+        self.services("svc-a", "svc-b")
+        m = self.table({
+            100: (1, "runsv svc-a", 5000),
+            102: (100, "vlogger -t svc-a -p daemon", 5000),
+            200: (1, "runsv svc-b", 3000),
+            201: (200, "/usr/bin/svc-b --daemon", 2000),
+        })
+        rows = self.run_check(m)
+        self.assertEqual(rows[0][0], "bad", rows)
+        self.assertIn("svc-a", rows[0][2])
+
+    def test_live_service_with_log_service_is_ok(self):
+        """Обратная сторона: настоящий сервис с vlogger — это ОК."""
+        self.services("svc-a")
+        m = self.table({
+            100: (1, "runsv svc-a", 5000),
+            101: (100, "/usr/bin/svc-a --daemon", 4000),
+            102: (100, "vlogger -t svc-a -p daemon", 5000),
+        })
+        rows = self.run_check(m)
+        self.assertEqual(rows[0][0], "ok", rows)
+
+    def test_freshly_started_is_warning(self):
+        """Только что поднявшийся сервис — повод глянуть лог, но не
+        поломка: после перезагрузки всё свежее."""
+        self.services("svc-a")
+        m = self.table({
+            100: (1, "runsv svc-a", 40),
+            101: (100, "/usr/bin/svc-a --daemon", 30),
+        })
+        rows = self.run_check(m)
+        self.assertEqual(rows[0][0], "warn", rows)
+        self.assertIn("svc-a", rows[0][2])
+
+    def test_uptime_ignores_vlogger(self):
+        """Аптайм берём у рабочего процесса, а не у vlogger: тот
+        старше и показал бы возраст сервиса неверно."""
+        self.services("svc-a")
+        m = self.table({
+            100: (1, "runsv svc-a", 5000),
+            101: (100, "/usr/bin/svc-a --daemon", 500),
+            102: (100, "vlogger -t svc-a -p daemon", 4000),
+        })
+        rows = self.run_check(m)
+        self.assertEqual(rows[0][0], "ok", rows)
+        # Рабочий процесс живёт 500 с (8 мин), vlogger — 4000 с (1 ч 6 мин).
+        # Если бы аптайм считался по vlogger, в строке было бы «1 ч».
+        self.assertIn("8 мин", rows[0][2], rows[0][2])
+        self.assertNotIn("1 ч", rows[0][2], rows[0][2])
+
+    def test_verbose_lists_services(self):
+        self.services("svc-a")
+        m = self.table({
+            100: (1, "runsv svc-a", 5000),
+            101: (100, "/usr/bin/svc-a --daemon", 4000),
+        })
+        rows = self.run_check(m, verbose=True)
+        self.assertGreater(len(rows), 1, "в -v сервисы не перечислены")
+        self.assertTrue(any("svc-a" in r[1] for r in rows[1:]), rows)
+
+    def test_missing_sysv_returns_nothing(self):
+        self.mod.SYSV = Path("/nonexistent/var/service")
+        rows = self.run_check(self.table({}))
+        self.assertEqual(rows, [], "нет /var/service — молчать надо")
+
+    def test_check_system_can_be_disabled(self):
+        self.mod.CHECK_SYSTEM = False
+        rows = self.run_check(self.table({}))
+        self.assertEqual(rows, [])
+
+
+class _Pal:
+    """Заглушка вместо Palette: проверки не красят вывод."""
+
+    def __getattr__(self, _n):
+        return lambda s: s
+
+
 class ConfLoading(unittest.TestCase):
     """Конфиг — единственное место, где живёт обстановка машины.
 
