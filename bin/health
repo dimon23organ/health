@@ -33,7 +33,51 @@ QUARANTINE = HOME / "Drop" / "md-unsent"
 KIT = HOME / "Drop" / "Server" / "void-kit.7z"
 TGCONF = HOME / ".config" / "tg-logbook" / "config.json"
 TGPAUSE = HOME / ".config" / "tg-logbook" / "PAUSE"
-SERVICES = ("autosync-dima", "tg-logbook", "opencode-db-backup")
+HEALTHCONF = HOME / ".config" / "health" / "config"
+
+# Имена сервисов, путь к ключу и адрес сервера берутся из
+# ~/.config/health/config. Зашивать их в скрипт нельзя: репозиторий
+# публичный, а проверять надо конкретную машину. Конфиг — единственное
+# место, где живёт обстановка конкретного пользователя.
+SERVICES = ("my-service",)
+SSH_KEY = "~/.ssh/id_ed25519"
+SERVER_HOST = "192.0.2.1"      # 192.0.2.0/24 зарезервирован для примеров
+SERVER_PORT = 22
+
+
+def load_conf(path: Path | None = None) -> bool:
+    """Читает ~/.config/health/config. Строки вида ключ=значение."""
+    global SERVICES, SSH_KEY, SERVER_HOST, SERVER_PORT
+    conf = path if path is not None else HEALTHCONF
+    if not conf.exists():
+        return False
+    vals = {}
+    try:
+        for raw in conf.read_text(encoding="utf-8").splitlines():
+            raw = raw.split("#", 1)[0].strip()
+            if not raw or "=" not in raw:
+                continue
+            k, v = raw.split("=", 1)
+            vals[k.strip()] = v.strip()
+    except OSError:
+        return False
+
+    if vals.get("services"):
+        SERVICES = tuple(s.strip() for s in vals["services"].split(",")
+                         if s.strip())
+    if vals.get("ssh_key"):
+        SSH_KEY = vals["ssh_key"]
+    if vals.get("server_host"):
+        SERVER_HOST = vals["server_host"]
+    if vals.get("server_port"):
+        try:
+            SERVER_PORT = int(vals["server_port"])
+        except ValueError:
+            pass
+    return True
+
+
+load_conf()
 
 H = 3600.0
 DAY = 24 * H
@@ -113,7 +157,7 @@ def belongs_to(pid: int, name: str, depth: int = 4) -> bool:
     Смотреть только на cmdline самого процесса нельзя: run-скрипт,
     который держит трап, не может делать exec — и в cmdline остаётся
     `/bin/sh ./run` без имени сервиса. Имя живёт в его родителе,
-    `runsv autosync-dima`. Поэтому идём вверх по родителям.
+    `runsv my-service`. Поэтому идём вверх по родителям.
     """
     seen = set()
     for _ in range(depth):
@@ -340,7 +384,7 @@ def check_telegram(p: Palette) -> list[tuple[str, str, str]]:
 # -------------------------------------------------------------------- ssh/ключ
 def check_keys(p: Palette) -> list[tuple[str, str, str]]:
     out = []
-    key = HOME / ".ssh" / "dima_server"
+    key = Path(SSH_KEY).expanduser()
     if not key.exists():
         return [("warn", "ключ к серверу", "нет %s" % key)]
     mode = oct(key.stat().st_mode & 0o777)
@@ -368,16 +412,18 @@ def check_opencode(p: Palette) -> list[tuple[str, str, str]]:
     return out
 
 
-# ------------------------------------------------------------------- сервер dima
+# ------------------------------------------------------------- удалённый сервер
 def check_server(verbose: bool, p: Palette) -> list[tuple[str, str, str]]:
     if not verbose:
         return []
     out = []
     try:
-        with socket.create_connection(("192.168.1.103", 53257), timeout=3):
-            out.append(("ok", "сервер dima", "порт 53257 отвечает"))
+        with socket.create_connection((SERVER_HOST, SERVER_PORT), timeout=3):
+            out.append(("ok", "сервер", "%s:%d отвечает"
+                        % (SERVER_HOST, SERVER_PORT)))
     except OSError as exc:
-        out.append(("warn", "сервер dima", "не отвечает: %s" % exc))
+        out.append(("warn", "сервер", "%s не отвечает: %s"
+                    % (SERVER_HOST, exc)))
     return out
 
 
