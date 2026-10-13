@@ -1,0 +1,454 @@
+#!/usr/bin/env python3
+"""health — одна строка: жива ли машина.
+
+Показывает то, что иначе проверяется руками по десять минут:
+сервисы, диск, свежесть бэкапов, карантин, кит, заслоны Telegram.
+
+    health            коротко, без сети
+    health -v         подробно
+    health --no-color
+
+Код возврата: 0 — всё хорошо, 1 — есть предупреждения, 2 — есть поломки.
+Скрипт ничего не чинит и ничего не отправляет: только читает.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HOME = Path.home()
+SV = HOME / ".config" / "sv"
+SVSTATE = HOME / ".local" / "state" / "sv"
+BACKUPS = HOME / ".local" / "state" / "opencode-backups"
+QUARANTINE = HOME / "Drop" / "md-unsent"
+KIT = HOME / "Drop" / "Server" / "void-kit.7z"
+TGCONF = HOME / ".config" / "tg-logbook" / "config.json"
+TGPAUSE = HOME / ".config" / "tg-logbook" / "PAUSE"
+SERVICES = ("autosync-dima", "tg-logbook", "opencode-db-backup")
+
+H = 3600.0
+DAY = 24 * H
+
+
+# ----------------------------------------------------------------- оформление
+class Palette:
+    def __init__(self, on: bool):
+        self.on = on
+
+    def _w(self, code: str, s: str) -> str:
+        return "\033[%sm%s\033[0m" % (code, s) if self.on else s
+
+    def ok(self, s):    return self._w("32", s)
+    def warn(self, s):  return self._w("33", s)
+    def bad(self, s):   return self._w("31", s)
+    def dim(self, s):   return self._w("2", s)
+    def bold(self, s):  return self._w("1", s)
+
+
+MARK = {"ok": "  ОК  ", "warn": " ВНИМ ", "bad": " СТОП "}
+
+
+def human(n: float) -> str:
+    for unit in ("Б", "КБ", "МБ", "ГБ", "ТБ"):
+        if abs(n) < 1024 or unit == "ТБ":
+            return "%.0f %s" % (n, unit) if unit == "Б" else "%.1f %s" % (n, unit)
+        n /= 1024
+    return "%.1f ТБ" % n
+
+
+def age_words(seconds: float) -> str:
+    s = int(seconds)
+    if s < 90:
+        return "%d с назад" % s
+    if s < 5400:
+        return "%d мин назад" % (s // 60)
+    if s < 2 * DAY:
+        return "%d ч назад" % (s // 3600)
+    return "%d дн назад" % (s // DAY)
+
+
+def proc_info(pid: int) -> tuple[str, float] | None:
+    """Командная строка и аптайм процесса. None — процесса нет.
+
+    Аптайм считаем через /proc, а не по буфетам runsv: буфер показывает
+    время с последнего перезапуска, а не то, что процесс жив.
+    """
+    try:
+        raw = Path("/proc/%d/stat" % pid).read_text(errors="replace")
+        cmd = Path("/proc/%d/cmdline" % pid).read_bytes().decode(
+            "utf-8", "replace").replace("\0", " ").strip()
+    except OSError:
+        return None
+    # comm в скобках может содержать пробелы и скобки — режем по хвосту.
+    tail = raw[raw.rindex(")") + 2:].split()
+    start_ticks = float(tail[19])          # поле 22, после comm и state
+    try:
+        hz = os.sysconf("SC_CLK_TCK")
+        up = float(Path("/proc/uptime").read_text().split()[0])
+    except (OSError, ValueError, IndexError):
+        return (cmd, 0.0)
+    return (cmd, max(0.0, up - start_ticks / hz))
+
+
+def ppid_of(pid: int) -> int:
+    try:
+        raw = Path("/proc/%d/stat" % pid).read_text(errors="replace")
+        return int(raw[raw.rindex(")") + 2:].split()[1])
+    except (OSError, ValueError, IndexError):
+        return 0
+
+
+def belongs_to(pid: int, name: str, depth: int = 4) -> bool:
+    """Является ли этот pid частью сервиса с таким именем.
+
+    Смотреть только на cmdline самого процесса нельзя: run-скрипт,
+    который держит трап, не может делать exec — и в cmdline остаётся
+    `/bin/sh ./run` без имени сервиса. Имя живёт в его родителе,
+    `runsv autosync-dima`. Поэтому идём вверх по родителям.
+    """
+    seen = set()
+    for _ in range(depth):
+        if pid <= 1 or pid in seen:
+            return False
+        seen.add(pid)
+        info = proc_info(pid)
+        if info is None:
+            return False
+        cmd, _up = info
+        if name in cmd:
+            return True
+        pid = ppid_of(pid)
+    return False
+
+
+# --------------------------------------------------------------------- сервисы
+def sv_status(svc: Path) -> tuple[int, str] | None:
+    """Что говорит сам runit. None — sv не справился."""
+    try:
+        res = subprocess.run(["sv", "status", str(svc)],
+                             capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return res.returncode, (res.stdout + res.stderr).strip()
+
+
+def check_services(p: Palette) -> list[tuple[str, str, str]]:
+    """Живость сервисов — по `sv status`, а не по собственным догадкам.
+
+    runit ведёт счётчик перезапусков и знает про состояние лучше, чем
+    разбор буферов. Второй заслон — supervise/pid плюс /proc: если номер
+    достался постороннему процессу, это надо назвать, а не пропустить.
+    """
+    out = []
+    for name in SERVICES:
+        svc = SV / name
+        title = "сервис %s" % name
+        if not (svc / "run").exists():
+            out.append(("bad", title, "нет каталога ~/.config/sv/%s" % name))
+            continue
+
+        st = sv_status(svc)
+        text = st[1] if st else ""
+
+        # Краш-луп: runsv перезапускает сервис по кругу.
+        m = re.search(r"\(run: (\d+) times in (\d+) seconds\)", text)
+        if m:
+            out.append(("warn", title, "перезапускается по кругу: %s раз за %s с"
+                        % (m.group(1), m.group(2))))
+            continue
+        if text.startswith("down:"):
+            out.append(("bad", title, "лежит: %s" % text.split(":", 1)[1].strip()))
+            continue
+        if text.startswith("finish:"):
+            out.append(("bad", title, "отработал и вышел: %s"
+                        % text.split(":", 1)[1].strip()))
+            continue
+
+        # sv не сумел сказать ничего определённого — каталог не под
+        # runsv, или сервис ещё не зарегистрирован. Тогда верим
+        # supervise/pid и /proc: они всё равно показывают, есть ли
+        # живой процесс с нашим именем.
+        why = "жив"
+        level = "ok"
+        if text.startswith("run:"):
+            why = "жив"
+            level = "ok"
+        else:
+            level, why = "warn", "sv не ведёт каталог (%s)" % text.split(":")[0][:28]
+
+        pidfile = svc / "supervise" / "pid"
+        if pidfile.exists():
+            try:
+                pid = int(pidfile.read_text().strip())
+            except (OSError, ValueError):
+                pid = None
+            if pid is None:
+                level, why = "warn", "supervise/pid не читается"
+            else:
+                info = proc_info(pid)
+                if info is None:
+                    level, why = "bad", "pid %d записан, процесса нет" % pid
+                else:
+                    cmd, up = info
+                    if not belongs_to(pid, name):
+                        level = "warn"
+                        why = "pid %d не похож на %s: %s" % (
+                            pid, name, cmd[:40] or "?")
+                    else:
+                        level = "ok"
+                        why = "pid %d, жив %s" % (
+                            pid, age_words(up).replace(" назад", ""))
+        else:
+            level, why = "warn", "нет supervise/pid"
+        out.append((level, title, why))
+
+        log = SVSTATE / name / "current"
+        if log.exists():
+            age = time.time() - log.stat().st_mtime
+            if age > 2 * DAY:
+                out.append(("warn", "лог %s" % name, "молчит %s" % age_words(age)))
+    return out
+
+
+# ----------------------------------------------------------------------- диск
+def check_disk(p: Palette) -> list[tuple[str, str, str]]:
+    out = []
+    for where, path in (("система", "/"), ("дома", str(HOME))):
+        try:
+            u = shutil.disk_usage(path)
+        except OSError as exc:
+            out.append(("bad", "диск %s" % where, str(exc)))
+            continue
+        free_gb = u.free / (1024 ** 3)
+        pct = u.used / u.total * 100 if u.total else 0
+        if free_gb < 2 or pct > 95:
+            level, why = "bad", "свободно %s, занято %.0f%%" % (human(u.free), pct)
+        elif free_gb < 10 or pct > 85:
+            level, why = "warn", "свободно %s, занято %.0f%%" % (human(u.free), pct)
+        else:
+            level, why = "ok", "свободно %s, занято %.0f%%" % (human(u.free), pct)
+        out.append((level, "диск %s" % where, why))
+    return out
+
+
+# --------------------------------------------------------------------- бэкапы
+def check_backups(p: Palette) -> list[tuple[str, str, str]]:
+    if not BACKUPS.is_dir():
+        return [("bad", "бэкапы сессий", "нет каталога %s" % BACKUPS)]
+    snaps = sorted(BACKUPS.glob("opencode-*.db"))
+    if not snaps:
+        return [("bad", "бэкапы сессий", "снимков нет ни одного")]
+    last = snaps[-1]
+    age = time.time() - last.stat().st_mtime
+    count = len(snaps)
+    size = human(last.stat().st_size)
+    if age > 30 * H:
+        level, why = "bad", "последний снимок %s — сервис молчит" % age_words(age)
+    elif age > 26 * H:
+        level, why = "warn", "последний снимок %s, ждём суточного" % age_words(age)
+    else:
+        level, why = "ok", "%d шт, свежий %s (%s)" % (count, age_words(age), size)
+    out = [(level, "бэкапы сессий", why)]
+
+    # Снимок без проверки — это надежда, а не страховка. Сверяем, что он
+    # открывается и внутри есть сессии. Раз в сутки дёшево, каждый раз —
+    # тоже дёшево, база 10 МБ.
+    try:
+        res = subprocess.run(
+            ["sqlite3", "-readonly", str(last), "SELECT COUNT(*) FROM session_v2;"],
+            capture_output=True, text=True, timeout=20)
+        n = res.stdout.strip()
+        if res.returncode != 0 or not n.isdigit() or int(n) == 0:
+            out.append(("bad", "снимок читается", "открылся, но сессий 0"))
+        else:
+            out.append(("ok", "снимок читается", "%s сессий в базе" % n))
+    except (OSError, subprocess.SubprocessError) as exc:
+        out.append(("bad", "снимок читается", str(exc)))
+
+    stale = [s for s in snaps if time.time() - s.stat().st_mtime > 14 * DAY]
+    if stale:
+        out.append(("warn", "хранение снимков", "%d старше 14 дн" % len(stale)))
+    return out
+
+
+# ------------------------------------------------------------------- карантин
+def check_quarantine(p: Palette) -> list[tuple[str, str, str]]:
+    if not QUARANTINE.is_dir():
+        return [("warn", "карантин md", "каталога нет — watcher его не создал")]
+    files = [f for f in QUARANTINE.rglob("*") if f.is_file()]
+    if files:
+        names = ", ".join(f.name for f in files[:3])
+        return [("bad", "карантин md",
+                 "%d файл(ей) не уехал: %s" % (len(files), names))]
+    return [("ok", "карантин md", "пусто, всё уехало")]
+
+
+# ------------------------------------------------------------------------ кит
+def check_kit(p: Palette) -> list[tuple[str, str, str]]:
+    if not KIT.exists():
+        return [("bad", "дроп-кит", "нет %s" % KIT)]
+    age = time.time() - KIT.stat().st_mtime
+    level = "bad" if age > 14 * DAY else ("warn" if age > 3 * DAY else "ok")
+    return [(level, "дроп-кит", "%s, собран %s"
+             % (human(KIT.stat().st_size), age_words(age)))]
+
+
+# ------------------------------------------------------------------ телеграм
+def check_telegram(p: Palette) -> list[tuple[str, str, str]]:
+    out = []
+    if not TGCONF.exists():
+        return [("bad", "telegram", "нет конфига %s" % TGCONF)]
+    try:
+        cfg = json.loads(TGCONF.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return [("bad", "telegram", "конфиг не читается: %s" % exc)]
+
+    tok = str(cfg.get("token", "") or "")
+    if not tok or tok == "PUT_TOKEN_HERE" or len(tok) < 20:
+        out.append(("bad", "telegram", "токен не заполнен"))
+    else:
+        out.append(("ok", "telegram", "токен на месте"))
+
+    try:
+        mode = oct(TGCONF.stat().st_mode & 0o777)
+    except OSError:
+        mode = "?"
+    if mode != "0o600":
+        out.append(("bad", "конфиг botа", "права %s, надо 600" % mode))
+    else:
+        out.append(("ok", "конфиг botа", "права 600"))
+
+    if TGPAUSE.exists():
+        out.append(("warn", "telegram", "PAUSE лежит — бот молчит"))
+    elif cfg.get("armed") is not True:
+        out.append(("warn", "telegram", "armed: false — молча отправляет"))
+    else:
+        allowed = cfg.get("allowed_chats") or []
+        out.append(("ok", "telegram", "взведён, чатов разрешено: %d" % len(allowed)))
+    return out
+
+
+# -------------------------------------------------------------------- ssh/ключ
+def check_keys(p: Palette) -> list[tuple[str, str, str]]:
+    out = []
+    key = HOME / ".ssh" / "dima_server"
+    if not key.exists():
+        return [("warn", "ключ к серверу", "нет %s" % key)]
+    mode = oct(key.stat().st_mode & 0o777)
+    if mode not in ("0o600", "0o400"):
+        out.append(("bad", "ключ к серверу", "права %s — ssh отвергнет" % mode))
+    else:
+        out.append(("ok", "ключ к серверу", "права %s" % mode))
+    return out
+
+
+# ---------------------------------------------------------------- конфиг opencode
+def check_opencode(p: Palette) -> list[tuple[str, str, str]]:
+    cfgp = HOME / ".config" / "opencode" / "opencode.jsonc"
+    if not cfgp.exists():
+        return [("bad", "opencode", "нет конфига")]
+    raw = cfgp.read_text(encoding="utf-8", errors="replace")
+    m = re.search(r'"model"\s*:\s*"([^"]+)"', raw)
+    if m:
+        out = [("ok", "opencode", "модель по умолчанию %s" % m.group(1))]
+    else:
+        out = [("warn", "opencode", "модель по умолчанию не задана явно")]
+    agents = sorted((HOME / ".config" / "opencode" / "agent").glob("*.md"))
+    skills = sorted((HOME / ".config" / "opencode" / "skills").glob("*/SKILL.md"))
+    out.append(("ok", "opencode", "%d агентов, %d навыков" % (len(agents), len(skills))))
+    return out
+
+
+# ------------------------------------------------------------------- сервер dima
+def check_server(verbose: bool, p: Palette) -> list[tuple[str, str, str]]:
+    if not verbose:
+        return []
+    out = []
+    try:
+        with socket.create_connection(("192.168.1.103", 53257), timeout=3):
+            out.append(("ok", "сервер dima", "порт 53257 отвечает"))
+    except OSError as exc:
+        out.append(("warn", "сервер dima", "не отвечает: %s" % exc))
+    return out
+
+
+def run_verbose_tools(verbose: bool, p: Palette) -> list[tuple[str, str, str]]:
+    """Раз в сутки прогоняем тесты тех проектов, где цена ошибки высока."""
+    stamp = HOME / ".local" / "state" / "health" / "last-selftest"
+    age = (time.time() - stamp.stat().st_mtime) if stamp.exists() else 1e12
+    if age < DAY:
+        return []
+    stamp.parent.mkdir(parents=True, exist_ok=True)
+    for repo, test in (("tg-logbook", "tests/test_guards.py"),):
+        r = HOME / "projects" / repo
+        if not (r / test).exists():
+            continue
+        try:
+            res = subprocess.run([sys.executable, str(r / test)],
+                                 capture_output=True, text=True, timeout=120, cwd=r)
+            tail = [ln for ln in res.stderr.splitlines() if ln.strip()]
+            verdict = "зелёные" if res.returncode == 0 else "КРАСНЫЕ"
+            out = [("ok" if res.returncode == 0 else "bad",
+                    "тесты %s" % repo, "%s%s" % (verdict,
+                     " (%s)" % tail[-1] if res.returncode and tail else ""))]
+        except (OSError, subprocess.SubprocessError) as exc:
+            out = [("warn", "тесты %s" % repo, "не запустились: %s" % exc)]
+        stamp.write_text(str(time.time()), encoding="utf-8")
+        return out
+    return []
+
+
+# -------------------------------------------------------------------------- вывод
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description="жива ли машина")
+    ap.add_argument("-v", "--verbose", action="store_true",
+                    help="подробно, включая сеть")
+    ap.add_argument("--no-color", action="store_true")
+    args = ap.parse_args(argv)
+    p = Palette(not args.no_color and sys.stdout.isatty())
+
+    rows: list[tuple[str, str, str]] = []
+    for fn in (check_services, check_disk, check_backups, check_quarantine,
+               check_kit, check_telegram, check_keys, check_opencode):
+        try:
+            rows.extend(fn(p))
+        except Exception as exc:                      # noqa: BLE001
+            rows.append(("bad", getattr(fn, "__name__", "проверка"),
+                         "проверка упала: %s" % exc))
+    rows.extend(check_server(args.verbose, p))
+    rows.extend(run_verbose_tools(args.verbose, p))
+
+    print()
+    for level, title, detail in rows:
+        paint = {"ok": p.ok, "warn": p.warn, "bad": p.bad}[level]
+        print("  %s  %-22s %s" % (paint(MARK[level]), p.bold(title), detail))
+
+    n_bad = sum(1 for r in rows if r[0] == "bad")
+    n_warn = sum(1 for r in rows if r[0] == "warn")
+    print()
+    if n_bad:
+        head = p.bad("  СТОП:  %d поломок" % n_bad)
+        tail = p.warn(", %d предупреждений" % n_warn) if n_warn else ""
+        print("%s%s" % (head, tail))
+    elif n_warn:
+        print(p.warn("  ВНИМАНИЕ: %d предупреждений, поломок нет" % n_warn))
+    else:
+        print(p.ok("  Всё живо. %d проверок пройдено." % len(rows)))
+    print()
+    return 2 if n_bad else (1 if n_warn else 0)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
