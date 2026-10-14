@@ -208,10 +208,22 @@ def check_system(p: Palette, verbose: bool) -> list[tuple[str, str, str]]:
     if not CHECK_SYSTEM or not SYSV.is_dir():
         return []
     try:
-        names = sorted(e.name for e in SYSV.iterdir() if e.is_dir() or e.is_symlink())
+        entries = list(SYSV.iterdir())
     except OSError as exc:
         return [("warn", "системные сервисы", "каталог не читается: %s" % exc)]
+    # is_dir() идёт ПО симлинку, поэтому битая ссылка даёт False и
+    # раньше молча попадала в names как обычный сервис — а runsv для
+    # неё не существует никогда. Итог был ложным «лежит» на ровно
+    # тех записях, которые остаются после удаления пакета.
+    orphans = sorted(e.name for e in entries
+                     if e.is_symlink() and not e.exists())
+    names = sorted(e.name for e in entries
+                   if (e.is_dir() or e.is_symlink()) and e.exists())
     if not names:
+        if orphans:
+            return [("warn", "системные сервисы",
+                     "в /var/service только осиротевшие ссылки: %s"
+                     % ", ".join(orphans[:4]))]
         return []
 
     table = proc_table()
@@ -229,7 +241,8 @@ def check_system(p: Palette, verbose: bool) -> list[tuple[str, str, str]]:
             down.append((name, "нет runsv — не супервизится"))
             continue
         kids = [pid for pid, (pp, cmd, _st) in table.items()
-                if pp == rv[0] and cmd and "vlogger" not in cmd]
+                if pp == rv[0] and cmd
+                and cmd.split()[0].split("/")[-1] != "vlogger"]
         if not kids:
             down.append((name, "runsv жив, рабочего процесса нет"))
             continue
@@ -270,7 +283,8 @@ def check_system(p: Palette, verbose: bool) -> list[tuple[str, str, str]]:
             if not rv:
                 continue
             kids = [pid for pid, (pp, cmd, _st) in table.items()
-                    if pp == rv[0] and cmd and "vlogger" not in cmd]
+                    if pp == rv[0] and cmd
+                    and cmd.split()[0].split("/")[-1] != "vlogger"]
             if not kids:
                 continue
             best = None
